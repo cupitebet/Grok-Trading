@@ -3,6 +3,8 @@
 Panduan teknis untuk sistem analisis sentimen crypto real-time berbasis data X (Twitter) dan model Grok (xAI). Hasil akhirnya adalah skor kuantitatif **-1.0 (sangat bearish) sampai +1.0 (sangat bullish)** per aset per jendela waktu, lengkap dengan ukuran ketidakpastian.
 
 > **Status:** dokumen desain (belum ada implementasi). Bukan nasihat keuangan.
+>
+> Lanjutan: [Eksekusi Aman ke Bursa](EKSEKUSI-AMAN.md), yang membahas API key, policy engine, circuit breaker, dan format webhook.
 
 ---
 
