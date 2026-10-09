@@ -1,0 +1,16 @@
+# Aset yang dipantau. `query` memakai sintaks X API v2 recent search.
+# Retweet murni dibuang di level query (-is:retweet) untuk menghemat kuota.
+#
+# Volume kata kunci umum seperti "bitcoin" sangat besar dan cepat menghabiskan kuota.
+# Mulai dari cashtag saja, lalu perluas jika kuota tier kamu cukup. Jika X mengembalikan
+# HTTP 400 karena operator tidak tersedia di tier kamu, ganti cashtag dengan kata kunci.
+
+[[asset]]
+symbol = "BTC"
+pair = "BTCUSDT"
+query = '$BTC -is:retweet (lang:en OR lang:id)'
+
+[[asset]]
+symbol = "ETH"
+pair = "ETHUSDT"
+query = '$ETH -is:retweet (lang:en OR lang:id)'
