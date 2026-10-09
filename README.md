@@ -5,6 +5,7 @@ Panduan teknis untuk sistem analisis sentimen crypto real-time berbasis data X (
 > **Status:** dokumen desain (belum ada implementasi). Bukan nasihat keuangan.
 >
 > Lanjutan:
+> - [Master Plan](MASTER-PLAN.md): peran agen, pipeline dari data mentah sampai live, tech stack, uji ketahanan
 > - [Eksekusi Aman ke Bursa](EKSEKUSI-AMAN.md): API key, policy engine, circuit breaker, format webhook
 > - [Bot DCA Dinamis](DCA-DINAMIS.md): sizing dari RSI + sentimen, manajemen risiko, prompt Grok 4, backtest, metrik
 
