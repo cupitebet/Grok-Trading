@@ -3,12 +3,14 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 
+from types import SimpleNamespace
+
 import httpx
 import pytest
 import respx
 from conftest import fake_client, tweet, user
 
-from gse import golden, market, status
+from gse import cli, golden, market, status
 from gse.config import Asset
 from gse.db import get_state
 from gse.ingest_x import ingest_asset, snapshot_t60
@@ -91,7 +93,7 @@ def test_context_tweet_becomes_match_when_found_by_query(db):
 
 
 def test_snapshot_t60_stores_metrics_and_marks_unavailable(db):
-    old = (datetime.now(timezone.utc) - timedelta(hours=3)).isoformat()
+    old = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
     fresh = datetime.now(timezone.utc).isoformat()
     ingest_asset(db, FakeX([page([tweet("1", created=old), tweet("2", created=old),
                                   tweet("3", created=fresh)])]), ASSET, 5)
@@ -101,6 +103,15 @@ def test_snapshot_t60_stores_metrics_and_marks_unavailable(db):
     assert count(db, "SELECT like_count FROM tweet_metrics WHERE tweet_id = '1' AND kind = 't60'") == 50
     assert count(db, "SELECT count(*) FROM tweets_raw WHERE deleted_at IS NOT NULL") == 1
     assert snapshot_t60(db, x, delay_minutes=60) == (0, 0)
+
+
+def test_snapshot_t60_skips_tweets_too_old_to_be_a_t60_snapshot(db):
+    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    ingest_asset(db, FakeX([page([tweet("1", created=stale)])]), ASSET, 5)
+
+    assert snapshot_t60(db, FakeX(lookup=[tweet("1", likes=999)]), delay_minutes=60) == (0, 0)
+    assert count(db, "SELECT count(*) FROM tweet_metrics WHERE kind = 't60'") == 0
+    assert count(db, "SELECT count(*) FROM tweets_raw WHERE deleted_at IS NOT NULL") == 0
 
 
 def scorer_reply(valid_ids, sentiment=lambda tid: 0.5):
@@ -146,6 +157,54 @@ def test_score_job_api_error_does_not_burn_attempts(db):
     with pytest.raises(httpx.ConnectError):
         score_pending(db, client, "m")
     assert count(db, "SELECT count(*) FROM score_attempts") == 0
+
+
+class Rejected(Exception):
+    status_code = 400
+
+
+def test_score_job_isolates_rejected_tweet_instead_of_blocking_queue(db):
+    ingest_asset(db, FakeX([page([tweet(str(i)) for i in range(1, 5)])]), ASSET, 5)
+    ok = scorer_reply({"1", "2", "3", "4"})
+
+    def reply(prompt):
+        return Rejected("content policy") if 'id="3"' in prompt else ok(prompt)
+
+    assert score_pending(db, fake_client(reply), "m", batch_size=4) == (3, 1)
+    assert count(db, "SELECT count(*) FROM tweet_scores") == 3
+    assert count(db, "SELECT attempts FROM score_attempts WHERE tweet_id = '3'") == 1
+    assert count(db, "SELECT count(*) FROM score_attempts") == 1
+
+
+def test_score_job_rate_limit_status_still_stops_run(db):
+    class Limited(Exception):
+        status_code = 429
+
+    ingest_asset(db, FakeX([page([tweet("1"), tweet("2")])]), ASSET, 5)
+    with pytest.raises(Limited):
+        score_pending(db, fake_client(lambda _: Limited("slow down")), "m")
+    assert count(db, "SELECT count(*) FROM score_attempts") == 0
+
+
+def test_golden_export_neutralises_spreadsheet_formulas(db, tmp_path):
+    texts = {"1": '=HYPERLINK("http://evil","x")', "2": "+5% hari ini", "3": "-1 lagi", "4": "@bob lfg",
+             "5": "aman saja"}
+    ingest_asset(db, FakeX([page([tweet(i, text=t) for i, t in texts.items()])]), ASSET, 5)
+    out = tmp_path / "golden.csv"
+    golden.export_sample(db, out, n=10, labeler="ana")
+    with out.open(encoding="utf-8-sig") as f:
+        exported = {r["tweet_id"]: r["text"] for r in csv.DictReader(f)}
+    assert exported["5"] == "aman saja"
+    assert all(exported[i] == "'" + texts[i] for i in "1234")
+
+
+def test_golden_import_rejects_tweet_asset_pair_that_does_not_exist(db, tmp_path):
+    ingest_asset(db, FakeX([page([tweet("1")])]), ASSET, 5)
+    f = tmp_path / "l.csv"
+    f.write_text("tweet_id,asset,label,note\n1,DOGE,0.5,\n1,BTC,0.5,\n", encoding="utf-8")
+    res = golden.import_labels(db, f, "ana")
+    assert res.imported == 1 and len(res.errors) == 1 and "DOGE" in res.errors[0]
+    assert count(db, "SELECT count(*) FROM golden_labels WHERE asset = 'DOGE'") == 0
 
 
 def test_golden_export_import_and_evaluate(db, tmp_path):
@@ -213,3 +272,17 @@ def test_sync_bars_paginates_and_skips_open_bar(db, monkeypatch):
     with httpx.Client() as http:
         n = market.sync_bars(db, http, "https://api.binance.com", "BTCUSDT", "1d", now_ms=start + 4 * day + 1)
     assert n == 1 and count(db, "SELECT count(*) FROM bars") == 4
+
+
+def test_golden_gate_counts_scored_tweets_not_just_labeled(db, capsys):
+    ingest_asset(db, FakeX([page([tweet(str(i)) for i in range(1, 601)])]), ASSET, 5)
+    db.execute("INSERT INTO golden_labels (tweet_id, asset, labeler, label)"
+               " SELECT tweet_id, 'BTC', 'ana', (tweet_id::int % 10) / 10.0 FROM tweets_raw")
+    valid = {str(i) for i in range(1, 21)}
+    score_pending(db, fake_client(scorer_reply(valid, lambda i: (int(i) % 10) / 10)), "m",
+                  limit=1000, batch_size=100, only_golden=True)
+
+    cli.cmd_golden_eval(SimpleNamespace(grok_model="m"), db, None)
+    out = capsys.readouterr().out
+    assert "label: 600" in out and "punya skor Grok saat ini: 20" in out
+    assert "BELUM" in out

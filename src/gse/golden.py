@@ -7,6 +7,14 @@ import psycopg
 
 from gse.grok_scorer import prompt_hash
 
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _safe_cell(value: str) -> str:
+    """Teks tweet dikendalikan penyerang; awalan ' mencegah Excel/Sheets menjalankannya sebagai formula."""
+    return "'" + value if value.startswith(FORMULA_PREFIXES) else value
+
+
 EXPORT_COLUMNS = ["tweet_id", "asset", "lang", "created_at", "context", "text", "label", "note"]
 
 
@@ -69,7 +77,7 @@ def export_sample(conn: psycopg.Connection, path: Path, n: int, labeler: str, se
         w = csv.writer(f)
         w.writerow(EXPORT_COLUMNS)
         for tid, asset, lang, created, ctx, text in rows:
-            w.writerow([tid, asset, lang or "", created.isoformat(), ctx or "", text, "", ""])
+            w.writerow([tid, asset, lang or "", created.isoformat(), _safe_cell(ctx or ""), _safe_cell(text), "", ""])
     return len(rows)
 
 
@@ -99,10 +107,11 @@ def import_labels(conn: psycopg.Connection, path: Path, labeler: str) -> ImportR
                 continue
             rows.append((row["tweet_id"], row["asset"], labeler, label, (row.get("note") or "").strip() or None))
 
-    known = {r[0] for r in conn.execute(
-        "SELECT tweet_id FROM tweets_raw WHERE tweet_id = ANY(%s)", ([r[0] for r in rows],))}
-    valid = [r for r in rows if r[0] in known]
-    result.errors += [f"tweet_id {r[0]} tidak ada di database" for r in rows if r[0] not in known]
+    known = set(conn.execute(
+        "SELECT tweet_id, asset FROM tweet_assets WHERE tweet_id = ANY(%s)", ([r[0] for r in rows],)).fetchall())
+    valid = [r for r in rows if (r[0], r[1]) in known]
+    result.errors += [f"pasangan tweet_id {r[0]} / aset {r[1]} tidak ada di database"
+                      for r in rows if (r[0], r[1]) not in known]
 
     with conn.transaction():
         with conn.cursor() as cur:
