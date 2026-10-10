@@ -28,7 +28,7 @@ Struktur kode ada di `src/gse/`, skema database di `src/gse/migrations/001_init.
 Butuh Python 3.11+, Docker, serta akun developer X dan xAI.
 
 ```bash
-cd grok-sentiment
+git clone https://github.com/cupitebet/Grok-Trading.git && cd Grok-Trading
 cp .env.example .env          # lalu isi password, X_BEARER_TOKEN, XAI_API_KEY
 docker compose up -d db
 python3 -m venv .venv && source .venv/bin/activate
@@ -58,7 +58,7 @@ Cek konsumsi aktual setiap hari dengan `gse status` (bagian "pemakaian API"), la
 ## 3. Jadwal Cron
 
 ```cron
-# m   h  dom mon dow  perintah (jalankan dari folder grok-sentiment dengan .env dimuat)
+# m   h  dom mon dow  perintah (jalankan dari folder repo dengan .env dimuat)
 */15  *  *   *   *    gse ingest-x
 */15  *  *   *   *    gse snapshot-metrics
 */10  *  *   *   *    gse score
@@ -66,10 +66,10 @@ Cek konsumsi aktual setiap hari dengan `gse status` (bagian "pemakaian API"), la
 30    0  *   *   *    gse fear-greed
 ```
 
-Contoh baris lengkap dengan logging:
+Contoh baris lengkap dengan logging (buat folder `logs/` dulu):
 
 ```cron
-*/15 * * * * cd /opt/gse/grok-sentiment && set -a && . ./.env && set +a && .venv/bin/gse ingest-x >> logs/ingest.log 2>&1
+*/15 * * * * cd /opt/Grok-Trading && set -a && . ./.env && set +a && .venv/bin/gse ingest-x >> logs/ingest.log 2>&1
 ```
 
 **Exit code** dipakai untuk memantau cron: `0` sukses, `1` error (jaringan, API, input), `2` rate limit X (run berikutnya otomatis melanjutkan).
