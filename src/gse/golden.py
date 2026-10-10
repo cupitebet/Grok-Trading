@@ -113,14 +113,13 @@ def import_labels(conn: psycopg.Connection, path: Path, labeler: str) -> ImportR
     result.errors += [f"pasangan tweet_id {r[0]} / aset {r[1]} tidak ada di database"
                       for r in rows if (r[0], r[1]) not in known]
 
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.executemany(
-                "INSERT INTO golden_labels (tweet_id, asset, labeler, label, note) VALUES (%s, %s, %s, %s, %s)"
-                " ON CONFLICT (tweet_id, asset, labeler)"
-                " DO UPDATE SET label = EXCLUDED.label, note = EXCLUDED.note, labeled_at = now()",
-                valid,
-            )
+    with conn.transaction(), conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO golden_labels (tweet_id, asset, labeler, label, note) VALUES (%s, %s, %s, %s, %s)"
+            " ON CONFLICT (tweet_id, asset, labeler)"
+            " DO UPDATE SET label = EXCLUDED.label, note = EXCLUDED.note, labeled_at = now()",
+            valid,
+        )
     result.imported = len(valid)
     return result
 

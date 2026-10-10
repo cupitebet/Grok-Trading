@@ -1,7 +1,9 @@
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
+
+from gse.retry import get_with_retry
 
 TWEET_FIELDS = "author_id,created_at,lang,conversation_id,referenced_tweets,public_metrics"
 USER_FIELDS = "created_at,public_metrics,verified,verified_type,description,profile_image_url,name,username"
@@ -29,16 +31,18 @@ class SearchPage:
 
 class XClient:
     def __init__(self, bearer_token: str, http: httpx.Client | None = None,
-                 base_url: str = "https://api.x.com/2"):
+                 base_url: str = "https://api.x.com/2", sleep=None):
         self.base_url = base_url.rstrip("/")
         self.http = http or httpx.Client(timeout=30)
         self.headers = {"Authorization": f"Bearer {bearer_token}"}
+        self._retry = {"sleep": sleep} if sleep is not None else {}
 
     def _get(self, path: str, params: dict) -> dict:
-        resp = self.http.get(f"{self.base_url}{path}", params=params, headers=self.headers)
+        resp = get_with_retry(self.http, f"{self.base_url}{path}", params=params, headers=self.headers,
+                              **self._retry)
         if resp.status_code == 429:
             reset = resp.headers.get("x-rate-limit-reset")
-            raise RateLimited(datetime.fromtimestamp(int(reset), timezone.utc) if reset else None)
+            raise RateLimited(datetime.fromtimestamp(int(reset), UTC) if reset else None)
         if resp.status_code >= 400:
             raise XApiError(f"HTTP {resp.status_code} dari {path}: {resp.text[:300]}")
         return resp.json()

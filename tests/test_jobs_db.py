@@ -1,8 +1,7 @@
 import csv
 import json
 import re
-from datetime import datetime, timedelta, timezone
-
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import httpx
@@ -93,8 +92,8 @@ def test_context_tweet_becomes_match_when_found_by_query(db):
 
 
 def test_snapshot_t60_stores_metrics_and_marks_unavailable(db):
-    old = (datetime.now(timezone.utc) - timedelta(minutes=90)).isoformat()
-    fresh = datetime.now(timezone.utc).isoformat()
+    old = (datetime.now(UTC) - timedelta(minutes=90)).isoformat()
+    fresh = datetime.now(UTC).isoformat()
     ingest_asset(db, FakeX([page([tweet("1", created=old), tweet("2", created=old),
                                   tweet("3", created=fresh)])]), ASSET, 5)
     x = FakeX(lookup=[tweet("1", likes=50)])
@@ -106,7 +105,7 @@ def test_snapshot_t60_stores_metrics_and_marks_unavailable(db):
 
 
 def test_snapshot_t60_skips_tweets_too_old_to_be_a_t60_snapshot(db):
-    stale = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+    stale = (datetime.now(UTC) - timedelta(days=2)).isoformat()
     ingest_asset(db, FakeX([page([tweet("1", created=stale)])]), ASSET, 5)
 
     assert snapshot_t60(db, FakeX(lookup=[tweet("1", likes=999)]), delay_minutes=60) == (0, 0)
@@ -235,7 +234,7 @@ def test_golden_export_import_and_evaluate(db, tmp_path):
 
 
 def test_status_gate1_detects_gaps(db):
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     steady = [tweet(str(i), created=(now - timedelta(minutes=30 * i)).isoformat()) for i in range(1, 15 * 48)]
     ingest_asset(db, FakeX([page(steady)]), ASSET, 5)
     [c] = status.coverage(db, "m", days=16)
