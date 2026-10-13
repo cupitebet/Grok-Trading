@@ -1,10 +1,11 @@
-from datetime import date, datetime, timezone
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import httpx
 import psycopg
 
 from gse.db import add_usage
+from gse.retry import get_with_retry
 
 INTERVAL_MS = {"1h": 3_600_000, "1d": 86_400_000}
 # Hari pertama Binance spot; histori sebelum ini tidak ada.
@@ -13,7 +14,7 @@ KLINE_LIMIT = 1000
 
 
 def _ms_to_dt(ms: int) -> datetime:
-    return datetime.fromtimestamp(ms / 1000, timezone.utc)
+    return datetime.fromtimestamp(ms / 1000, UTC)
 
 
 def parse_kline(k: list) -> dict:
@@ -26,8 +27,8 @@ def parse_kline(k: list) -> dict:
 
 
 def fetch_klines(http: httpx.Client, base_url: str, symbol: str, interval: str, start_ms: int) -> list[list]:
-    resp = http.get(
-        f"{base_url.rstrip('/')}/api/v3/klines",
+    resp = get_with_retry(
+        http, f"{base_url.rstrip('/')}/api/v3/klines",
         params={"symbol": symbol, "interval": interval, "startTime": start_ms, "limit": KLINE_LIMIT},
     )
     resp.raise_for_status()
@@ -40,7 +41,7 @@ def sync_bars(conn: psycopg.Connection, http: httpx.Client, base_url: str, symbo
     if interval not in INTERVAL_MS:
         raise ValueError(f"interval {interval} tidak didukung")
     step = INTERVAL_MS[interval]
-    now_ms = now_ms or int(datetime.now(timezone.utc).timestamp() * 1000)
+    now_ms = now_ms or int(datetime.now(UTC).timestamp() * 1000)
 
     last = conn.execute(
         "SELECT max(open_time) FROM bars WHERE symbol = %s AND interval = %s", (symbol, interval)
@@ -72,7 +73,7 @@ FNG_URL = "https://api.alternative.me/fng/"
 
 def parse_fear_greed(body: dict) -> list[tuple[date, int, str]]:
     return [
-        (datetime.fromtimestamp(int(d["timestamp"]), timezone.utc).date(), int(d["value"]),
+        (datetime.fromtimestamp(int(d["timestamp"]), UTC).date(), int(d["value"]),
          d["value_classification"])
         for d in body.get("data", [])
     ]
@@ -80,7 +81,7 @@ def parse_fear_greed(body: dict) -> list[tuple[date, int, str]]:
 
 def sync_fear_greed(conn: psycopg.Connection, http: httpx.Client, url: str = FNG_URL) -> int:
     """Ambil seluruh histori (limit=0). Nilai yang sudah ada diperbarui jika berubah."""
-    resp = http.get(url, params={"limit": 0, "format": "json"})
+    resp = get_with_retry(http, url, params={"limit": 0, "format": "json"})
     resp.raise_for_status()
     rows = parse_fear_greed(resp.json())
     with conn.transaction():

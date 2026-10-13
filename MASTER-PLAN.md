@@ -37,7 +37,7 @@ Rencana R&D dan deployment yang menyatukan tiga dokumen sebelumnya menjadi satu 
 Istilah "agen" di dokumen ini berarti **service otonom dengan tanggung jawab tunggal** yang berkomunikasi lewat message broker. Hanya satu agen yang memakai LLM.
 
 **Prinsip lain:**
-1. **Setiap agen bisa gagal sendiri tanpa menjatuhkan yang lain.** Sentimen mati → strategi jalan dengan RSI saja. Strategi mati → posisi tetap dilindungi stop di bursa.
+1. **Setiap agen bisa gagal sendiri tanpa menjatuhkan yang lain.** Sentimen mati → strategi jalan dengan RSI saja. Strategi mati → tidak ada order baru. Profil `directional` tetap dilindungi stop di bursa; profil `dca_spot` memegang aset spot tanpa leverage dan tanpa order menggantung, jadi tidak ada risiko likuidasi.
 2. **Bursa adalah sumber kebenaran** untuk saldo dan posisi. State lokal selalu direkonsiliasi ke bursa.
 3. **Kode yang sama dari backtest sampai live.** Yang berganti hanya adapter data dan adapter eksekusi.
 
@@ -95,7 +95,7 @@ Kamu menyebut tiga agen. Dua komponen tambahan, **Strategy Engine** dan **Watchd
 | **Input** | X API, Grok API | `sentiment.signals`, data pasar | `strategy.intents`, saldo dari `exec.reports` | `risk.approved` | Heartbeat semua agen, feed harga sendiri |
 | **Output** | `sentiment.signals` | `strategy.intents` | `risk.approved` / `risk.rejected` | `exec.reports` | `system.breaker`, `alerts` |
 | **Akses secret** | Key X API, key xAI | Tidak ada | Tidak ada | Key bursa (trade-only) | Key bursa cadangan (trade-only, untuk cancel) |
-| **Kalau mati** | Strategi pakai RSI saja (`NO_SIGNAL`) | Tidak ada order baru, stop di bursa tetap aktif | Semua intent tertahan (fail-closed) | Breaker `HALT_NEW`, Watchdog ambil alih cancel | Agen lain lanjut, alert "watchdog down" dari heartbeat eksternal |
+| **Kalau mati** | Strategi pakai RSI saja (`NO_SIGNAL`) | Tidak ada order baru (profil `directional`: stop di bursa tetap aktif) | Semua intent tertahan (fail-closed) | Breaker `HALT_NEW`, Watchdog ambil alih cancel | Agen lain lanjut, alert "watchdog down" dari heartbeat eksternal |
 | **Dokumen detail** | [README](README.md) | [DCA-DINAMIS](DCA-DINAMIS.md) | [EKSEKUSI-AMAN §3](EKSEKUSI-AMAN.md#3-desain-eksekusi-aifi-yang-tahan-manipulasi) | [EKSEKUSI-AMAN §2, §4.2](EKSEKUSI-AMAN.md#2-standar-keamanan-api-key) | [EKSEKUSI-AMAN §4](EKSEKUSI-AMAN.md#4-circuit-breaker) |
 
 **Fail-closed:** kalau Risk Manager tidak bisa memastikan intent aman (misalnya data saldo belum diperbarui atau database tidak bisa dibaca), intent **ditolak**, bukan diloloskan.
@@ -187,7 +187,7 @@ Yang diukur:
 
 ### Fase 5 — Live Kecil (minggu 17–28)
 
-- **Testnet dulu (1–2 minggu)** untuk memastikan adapter eksekusi asli, tanda tangan, dan pemasangan stop bekerja.
+- **Testnet dulu (1–2 minggu)** untuk memastikan adapter eksekusi asli, tanda tangan, dan (untuk profil `directional`) pemasangan stop bekerja.
 - **Mainnet dengan 10% modal** di sub-account khusus, semua setting keamanan dari [EKSEKUSI-AMAN §6](EKSEKUSI-AMAN.md#6-checklist-sebelum-live) aktif.
 - Approval manusia untuk setiap order boost (m > 1.5) di bulan pertama.
 
@@ -284,7 +284,7 @@ IP VPS-2 juga dimasukkan ke allowlist key cadangan, supaya Watchdog bisa membata
 | Skenario | Cara menguji | Perilaku yang diharapkan | Kriteria lolos |
 |----------|-------------|--------------------------|----------------|
 | **Replay crash historis** | Putar ulang data menit Maret 2020, Mei 2022, November 2022 ke seluruh pipeline dengan kecepatan 10× | Breaker naik level sesuai aturan, pacing membatasi belanja, sentimen ditangani sesuai mitigasi panik | Belanja 30 hari tidak melebihi cap, tidak ada order ditolak bursa karena harga basi |
-| **Gap harga sintetis** | Suntikkan penurunan −15% dalam 1 menit | Watchdog memicu `HALT_NEW`, order entry dibatalkan, stop di bursa tetap ada | Waktu deteksi → cancel < 10 detik |
+| **Gap harga sintetis** | Suntikkan penurunan −15% dalam 1 menit | Watchdog memicu `HALT_NEW`, order entry dibatalkan, stop di bursa tetap ada (`directional`); order `IOC` pada `dca_spot` tidak menggantung | Waktu deteksi → cancel < 10 detik |
 | **Lonjakan volume cuitan 20×** | Putar ulang stream rekaman dengan kecepatan 20× | Antrian menumpuk tapi tidak hilang. Data melewati TTL dibuang. Grok dipanggil dalam batch lebih besar. | Lag konsumen pulih < 15 menit setelah lonjakan, memori stabil |
 | **Divergensi harga antar-bursa** | Feed Binance dan Coinbase dibuat berbeda 4% | `HALT_NEW` (anggap data rusak) | Tidak ada order selama divergensi |
 | **Spread melebar & book menipis** | Mock order book dengan kedalaman −90% | Risk Manager menolak intent (`INSUFFICIENT_LIQUIDITY`) | Tidak ada fill dengan slippage di atas batas |
@@ -294,7 +294,7 @@ IP VPS-2 juga dimasukkan ke allowlist key cadangan, supaya Watchdog bisa membata
 | Skenario | Cara | Perilaku yang diharapkan |
 |----------|------|-------------------------|
 | Execution crash di tengah pengiriman order | `docker kill` tepat setelah request terkirim | Saat bangkit: baca outbox, cek status order di bursa via `client_order_id`, tidak mengirim ulang order yang sudah ada |
-| Koneksi VPS-1 ke bursa putus | Blokir egress dengan iptables | Stop di bursa melindungi posisi. Watchdog di VPS-2 mendeteksi dan memicu breaker. |
+| Koneksi VPS-1 ke bursa putus | Blokir egress dengan iptables | `directional`: stop di bursa melindungi posisi. `dca_spot`: tidak ada order menggantung dan tidak ada leverage, jadi yang terjadi hanya pembelian tertunda. Watchdog di VPS-2 mendeteksi dan memicu breaker. |
 | Redis mati | Stop kontainer | Agen fail-closed: tidak ada intent yang diproses. Pulih otomatis tanpa pesan dobel. |
 | Postgres mati | Stop kontainer | Risk Manager menolak semua intent (tidak bisa validasi saldo). Alert CRITICAL. |
 | Pesan dobel / tidak berurutan | Kirim ulang pesan dengan `msg_id` sama, ubah urutan | Diproses tepat satu kali, pesan basi dibuang |
@@ -342,7 +342,7 @@ Estimasi ini untuk 1–2 engineer. Fase yang tumpang tindih bisa dikerjakan para
 
 **Saat alert CRITICAL:**
 1. Buka dashboard, cek state breaker dan posisi di **dashboard bursa** (bukan hanya di Grafana).
-2. Kalau ragu: `/kill` dari Telegram. Posisi tetap dilindungi stop di bursa.
+2. Kalau ragu: `/kill` dari Telegram. Posisi `directional` tetap dilindungi stop di bursa; `dca_spot` hanya berhenti membeli.
 3. Kalau dicurigai key bocor: cabut key di dashboard bursa terlebih dahulu, baru investigasi.
 4. Selidiki penyebab lewat log berdasarkan `intent_id` / `msg_id`.
 5. Resume hanya lewat CLI, dengan alasan tertulis di audit log.

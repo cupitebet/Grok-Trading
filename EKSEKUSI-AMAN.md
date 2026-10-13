@@ -166,24 +166,36 @@ def load_exchange_key(secret_id: str) -> dict:
 
 ### 3.2 Policy Engine (Deterministik)
 
-Setiap intent harus lolos **semua** aturan berikut. Satu saja gagal, intent ditolak dengan `reason_code`.
+Setiap intent membawa field `strategy` yang memilih **profil kebijakan**. Dua profil sengaja dibuat berbeda karena menjaga dua jenis risiko yang berbeda:
 
-| Aturan | Contoh konfigurasi |
-|--------|-------------------|
-| Allowlist venue + simbol | `binance: [BTCUSDT, ETHUSDT, SOLUSDT]` |
-| Aksi yang diizinkan | `OPEN`, `REDUCE`, `CLOSE`, `CANCEL`. Tidak ada aksi lain. |
-| Max notional per order | $500 |
-| Max posisi per simbol | $2.000 |
-| Max eksposur total | $5.000 |
-| Max kerugian harian | −$300 (realized + unrealized). Kalau tercapai, breaker ke `HALT_NEW`. |
-| Rate limit intent | ≤ 6/menit, ≤ 60/hari |
-| Sanity harga | `limit_price` harus berada dalam ±50 bps dari mid feed independen (§4.3) |
-| Tipe order | Hanya `LIMIT` dengan `IOC`/`GTC`. **Market order dilarang**, karena slippage-nya tidak terbatas. |
-| Stop wajib | Setiap `OPEN` harus menyertakan `stop_loss`, dan stop itu harus dipasang di bursa (§4.2) |
-| Likuiditas | Kedalaman order book dalam 0.5% dari mid ≥ 10× ukuran order |
-| Cek silang sinyal | `signal_id` harus ada di database mesin sentimen, belum kedaluwarsa, dan arah intent harus sesuai tanda Z_t |
-| Kesegaran | `now < expires_at` dan umur intent ≤ 30 detik |
-| Status breaker | Hanya `NORMAL` yang menerima `OPEN`. Status lain hanya menerima `REDUCE`/`CLOSE`/`CANCEL`. |
+| Profil | Untuk | Risiko utama | Cara melindungi |
+|--------|-------|--------------|-----------------|
+| `directional` | Posisi long/short yang dibuka berdasarkan sinyal, termasuk margin/futures | Posisi salah arah, likuidasi | Stop di bursa, batas rugi harian |
+| `dca_spot` | Akumulasi spot bertahap tanpa leverage ([DCA-DINAMIS](DCA-DINAMIS.md)) | Anggaran habis terlalu cepat, bug yang membeli berulang | Batas belanja, pacing, breaker drawdown ekuitas |
+
+Aturan yang sama tidak boleh dipaksakan ke kedua profil. Contohnya, "wajib stop-loss" masuk akal untuk posisi directional tapi membatalkan tujuan akumulasi spot, dan "beli hanya jika sentimen positif" adalah kebalikan dari strategi DCA yang sengaja membeli saat sentimen panik.
+
+Setiap intent harus lolos **semua** aturan profilnya. Satu saja gagal, intent ditolak dengan `reason_code`. Angka di bawah adalah contoh untuk modal C = $10.000, f_dca = 0,8 (B = $8.000), N = 52, b₀ = $153,85, m_max = 3.
+
+| Aturan | Profil `directional` | Profil `dca_spot` |
+|--------|---------------------|-------------------|
+| Allowlist venue + simbol | `binance: [BTCUSDT, ETHUSDT, SOLUSDT]` | `binance: [BTCUSDT, ETHUSDT]` |
+| Aksi yang diizinkan | `OPEN`, `REDUCE`, `CLOSE`, `CANCEL` | `OPEN` hanya `BUY`, `REDUCE` hanya `SELL` (trailing take profit), `CANCEL`. Tidak ada `CLOSE` otomatis. |
+| Max notional per order | $500 | b₀ × m_max = $461,55 (dibulatkan ke $500). Saat `NO_SIGNAL`: b₀ × (1 + a) = $307,70, karena `m_sent` = 1 |
+| Max posisi per simbol | $2.000 | max_asset_share × C = 0,7 × $10.000 = $7.000 |
+| Max eksposur total | $5.000 | B = $8.000 |
+| Batas kerugian | Rugi harian −$300 (realized + unrealized) → `HALT_NEW` | **Tidak ada batas rugi harian.** Turun 4–10% dalam sehari wajar bagi pemegang aset spot dan bukan tanda bot rusak. Gantinya: belanja 24 jam ≤ 2 × max notional per order, `cap_30d`, dan breaker drawdown ekuitas ([DCA-DINAMIS §2.4](DCA-DINAMIS.md#24-batas-penurunan-modal-drawdown)) |
+| Rate limit intent | ≤ 6/menit, ≤ 60/hari | ≤ 3/menit, ≤ 10/hari (satu slot + percobaan ulang) |
+| Sanity harga | `limit_price` dalam ±50 bps dari mid feed independen (§4.3) | Sama |
+| Tipe order | Hanya `LIMIT` dengan `IOC`/`GTC`. **Market order dilarang**, karena slippage-nya tidak terbatas. | Hanya `LIMIT` `IOC`. Market order dilarang. |
+| Stop | **Wajib.** Setiap `OPEN` menyertakan `stop_loss`, dan stop itu dipasang di bursa (§4.2) | **Tidak ada stop per pembelian.** Spot tanpa leverage tidak bisa dilikuidasi, dan stop di tengah crash membuang inti strategi. |
+| Likuiditas | Kedalaman order book dalam 0,5% dari mid ≥ 10× ukuran order | Sama |
+| Cek silang sinyal | `signal_id` ada, belum kedaluwarsa, dan arah intent harus sesuai tanda Z_t | `signal_id` ada dan belum kedaluwarsa. **Arah tidak dicocokkan dengan tanda Z_t**, karena strategi sengaja kontrarian. |
+| Sinyal `NO_SIGNAL` | Tidak ada `OPEN` baru | `OPEN` tetap boleh, tetapi notional ≤ b₀ × (1 + a). Tidak ada boost dari sentimen. |
+| Kesegaran | `now < expires_at` dan umur intent ≤ 30 detik | Sama |
+| Status breaker | `NORMAL`: `OPEN` penuh. `DEGRADED`: `OPEN` dengan ukuran ×0,5 dan approval manusia. `HALT_NEW`/`KILL`: hanya `REDUCE`/`CLOSE`/`CANCEL` | Sama |
+
+Batas posisi, eksposur, belanja, dan kerugian **hanya berlaku untuk `OPEN`**. Aksi `REDUCE`/`CLOSE`/`CANCEL` tidak boleh ditolak oleh batas-batas itu, karena justru dibutuhkan saat batas sudah tercapai.
 
 ```python
 from decimal import Decimal
@@ -192,27 +204,41 @@ class Reject(Exception):
     def __init__(self, code: str): self.code = code
 
 def check_policy(intent, cfg, mkt, book, sig_db, state):
+    p = cfg.profiles[intent.strategy]                              # "directional" | "dca_spot"
     o = intent.order
-    if intent.symbol not in cfg.allowlist[intent.venue]:          raise Reject("SYMBOL_NOT_ALLOWED")
+    is_open = intent.action == "OPEN"
+    if intent.symbol not in p.allowlist[intent.venue]:             raise Reject("SYMBOL_NOT_ALLOWED")
     if o.type != "LIMIT":                                          raise Reject("ORDER_TYPE_NOT_ALLOWED")
-    if intent.action == "OPEN" and state.breaker != "NORMAL":      raise Reject("BREAKER_ACTIVE")
-    if intent.action == "OPEN" and intent.risk.stop_loss is None:  raise Reject("STOP_REQUIRED")
-
-    notional = o.qty * o.limit_price
-    if notional > cfg.max_order_notional:                          raise Reject("ORDER_TOO_LARGE")
-    if state.position_notional(intent.symbol) + notional > cfg.max_position:
-                                                                   raise Reject("POSITION_LIMIT")
-    if state.daily_pnl <= -cfg.max_daily_loss:                     raise Reject("DAILY_LOSS_LIMIT")
+    if (intent.action, intent.side) not in p.allowed_actions:      raise Reject("ACTION_NOT_ALLOWED")
+    if is_open and state.breaker in ("HALT_NEW", "KILL"):          raise Reject("BREAKER_ACTIVE")
+    if is_open and p.stop_required and intent.risk.stop_loss is None:
+                                                                   raise Reject("STOP_REQUIRED")
 
     mid = mkt.mid(intent.symbol)                                   # feed independen, bukan dari agen
     if abs(o.limit_price - mid) / mid * 10_000 > cfg.max_price_dev_bps:
                                                                    raise Reject("PRICE_OUT_OF_BAND")
-    if book.depth_within(intent.symbol, Decimal("0.005")) < notional * 10:
+
+    if is_open:                                                    # batas hanya untuk menambah risiko
+        notional = o.qty * o.limit_price
+        cap = p.max_order_notional / (2 if state.breaker == "DEGRADED" else 1)
+        if notional > cap:                                         raise Reject("ORDER_TOO_LARGE")
+        if state.position_notional(intent.symbol) + notional > p.max_position:
+                                                                   raise Reject("POSITION_LIMIT")
+        if state.total_exposure() + notional > p.max_total_exposure:
+                                                                   raise Reject("EXPOSURE_LIMIT")
+        if p.max_daily_loss is not None and state.daily_pnl <= -p.max_daily_loss:
+                                                                   raise Reject("DAILY_LOSS_LIMIT")
+        if p.max_spend_24h is not None and state.spent_24h + notional > p.max_spend_24h:
+                                                                   raise Reject("SPEND_LIMIT_24H")
+        if book.depth_within(intent.symbol, Decimal("0.005")) < notional * 10:
                                                                    raise Reject("INSUFFICIENT_LIQUIDITY")
 
     sig = sig_db.get(intent.signal.signal_id)
     if sig is None or sig.expired:                                 raise Reject("SIGNAL_UNKNOWN")
-    if intent.action == "OPEN" and (sig.z > 0) != (intent.side == "BUY"):
+    if is_open and sig.status == "NO_SIGNAL":
+        if not p.allow_open_without_signal:                        raise Reject("NO_SIGNAL")
+        if o.qty * o.limit_price > p.max_order_notional_no_signal: raise Reject("ORDER_TOO_LARGE_NO_SIGNAL")
+    elif is_open and p.signal_direction_check and (sig.z > 0) != (intent.side == "BUY"):
                                                                    raise Reject("SIGNAL_MISMATCH")
 ```
 
@@ -234,15 +260,19 @@ def check_policy(intent, cfg, mkt, book, sig_db, state):
  NORMAL ───────────────► DEGRADED ───────────────► HALT_NEW ───────────────► KILL
    ▲                      │ ukuran order ×0.5        │ hanya reduce/close       │ cancel semua order,
    │                      │ approval wajib           │ cancel order entry       │ hentikan semua proses,
-   │                      │                          │ terbuka                  │ (opsional) FLATTEN
+   │                      │                          │ terbuka                  │ (opsional, hanya directional) FLATTEN
    └── reset otomatis ────┘                          └── reset MANUAL ──────────┘
        setelah 15 mnt stabil                             (manusia + alasan tertulis)
 ```
 
 - **Latch:** `HALT_NEW` dan `KILL` **tidak pernah kembali otomatis**. Kalau bot mati karena flash crash, manusia yang memutuskan kapan aman untuk lanjut.
+- **`FLATTEN` hanya untuk profil `directional`.** Pada profil `dca_spot`, `KILL` menghentikan pembelian dan membatalkan order yang menggantung, tetapi tidak pernah menjual simpanan secara otomatis (lihat §4.4).
+- **Dua state machine, satu pemetaan.** Strategy Engine punya state internal `NORMAL/WASPADA/HALT/HARD_STOP` untuk drawdown ekuitas ([DCA-DINAMIS §2.4](DCA-DINAMIS.md#24-batas-penurunan-modal-drawdown)). Gateway hanya mengenal `NORMAL/DEGRADED/HALT_NEW/KILL`. `WASPADA` murni urusan strategi (membatasi multiplier) dan tidak muncul di gateway. `HALT` strategi diteruskan sebagai `HALT_NEW`, dan `HARD_STOP` sebagai `KILL` tanpa `FLATTEN`. Gateway selalu memakai state yang lebih ketat dari kedua sisi.
 - Watchdog berjalan sebagai **proses terpisah** (idealnya di host terpisah), dengan feed harga sendiri. Kalau executor hang, watchdog tetap bisa bertindak memakai key cadangannya.
 
 ### 4.2 Proteksi yang Tetap Jalan Saat Bot Mati
+
+> **Cakupan:** bagian ini untuk profil `directional` dan semua posisi margin/futures. Profil `dca_spot` tidak memakai stop dan tidak punya order menggantung (semua order `IOC`). Kalau bot mati, yang terjadi hanya pembelian tertunda, tanpa risiko likuidasi. Perlindungan modalnya adalah batas belanja dan breaker drawdown, bukan stop di bursa. Poin 3 (rekonsiliasi saat reconnect) tetap berlaku untuk kedua profil.
 
 Masalah utama: **kalau koneksi API putus, bot juga tidak bisa menutup posisi.** Logika "tutup posisi saat koneksi drop" tidak bisa dieksekusi justru di saat dibutuhkan. Jadi proteksi harus **sudah ada di bursa sebelum masalah terjadi**:
 
@@ -264,15 +294,22 @@ Masalah utama: **kalau koneksi API putus, bot juga tidak bisa menutup posisi.** 
 | **Flash crash** | Harga bergerak > 5% dalam 60 detik, **dikonfirmasi ≥ 2 sumber** (mis. Binance + Coinbase) | HALT_NEW + cancel order entry |
 | | Spread > 10× median 1 jam, atau kedalaman book turun > 80% | HALT_NEW |
 | | Harga antar-bursa menyimpang > 3% | HALT_NEW (kemungkinan data rusak atau ada gangguan di satu bursa) |
-| **Risiko** | Rugi harian ≥ batas | HALT_NEW |
-| | Drawdown dari puncak ekuitas ≥ 2× batas harian | KILL + FLATTEN |
+| **Risiko** | (`directional`) Rugi harian ≥ batas | HALT_NEW |
+| | (`directional`) Drawdown dari puncak ekuitas ≥ 2× batas harian | KILL + FLATTEN |
+| | (`dca_spot`) Drawdown ekuitas ≥ level `dd_halt` / `dd_hard` | HALT_NEW / KILL, tanpa FLATTEN |
+| | (`dca_spot`) Belanja 24 jam atau 30 hari melewati batas | Intent ditolak; tiga penolakan beruntun → HALT_NEW (kemungkinan bug yang membeli berulang) |
 | | Posisi di bursa ≠ state lokal | HALT_NEW |
 | **Agen** | Rasio intent yang ditolak policy > 50% dalam 10 menit | DEGRADED (ada yang aneh dengan agen) |
 | | Intent `OPEN` melebihi rate limit berulang kali | HALT_NEW |
-| | Mesin sentimen mengeluarkan `NO_SIGNAL` | Tidak ada `OPEN` baru untuk aset itu |
+| | Mesin sentimen mengeluarkan `NO_SIGNAL` | `directional`: tidak ada `OPEN` baru untuk aset itu. `dca_spot`: `OPEN` tetap boleh dengan notional ≤ b₀ × (1 + a), tanpa boost sentimen. |
 | **Manual** | Kill switch (CLI, tombol dashboard, perintah Telegram dari user terverifikasi) | KILL |
 
 **Pengendalian slippage sejak awal.** Daripada mendeteksi slippage setelah terjadi, batasi lewat cara order dikirim: gunakan `LIMIT` + `IOC` dengan harga batas = harga acuan ± `max_slippage_bps`. Order hanya terisi di harga yang kamu izinkan. Sisanya otomatis batal, tidak "mengejar" harga.
+
+**Kalau `IOC` tidak terisi.** Saat pasar panik, order book tipis dan `IOC` mudah gagal, justru di saat pembelian paling dibutuhkan. Aturannya (berlaku untuk `dca_spot`):
+1. Percobaan ulang maksimal 3 kali dalam 15 menit. Setiap percobaan adalah intent baru dengan `intent_id` baru, harga acuan dari mid terbaru, dan tetap di dalam `max_slippage_bps` serta batas sanity harga. Batas harga tidak pernah dilonggarkan untuk mengejar fill.
+2. Jika semua percobaan gagal, slot ditandai terlewat dan diulang pada bar berikutnya, paling lama 2 hari. Sesudah itu slot dilewati.
+3. Satu slot tidak pernah menghasilkan lebih dari satu pembelian yang terisi. Fill sebagian dihitung sebagai terisi sebagian, dan sisanya tidak dikejar.
 
 ### 4.4 Flash Crash: Tutup Posisi atau Tidak?
 
@@ -281,9 +318,10 @@ Insting pertama saat flash crash biasanya "tutup semua posisi sekarang". Tapi sa
 Kebijakan yang disarankan:
 
 1. **Langsung:** cancel semua order entry, state ke `HALT_NEW`. Jangan membuka posisi baru.
-2. **Biarkan stop yang sudah ada di bursa bekerja.** Stop-limit dengan batas harga melindungi dari harga yang terlalu ekstrem.
+2. **Biarkan stop yang sudah ada di bursa bekerja** (profil `directional`). Stop-limit dengan batas harga melindungi dari harga yang terlalu ekstrem. Profil `dca_spot` tidak punya stop, jadi tidak ada yang berjalan di tahap ini.
 3. **FLATTEN hanya jika** batas drawdown tercapai. Itu pun dilakukan bertahap dengan limit IOC: jual sebagian setiap beberapa detik dengan batas harga, bukan satu market order besar.
-4. **Untuk posisi leverage**, prioritasnya berbeda: risiko likuidasi lebih besar daripada risiko jual murah. Kurangi posisi lebih agresif ketika jarak ke harga likuidasi < 2× ATR.
+4. **Profil `dca_spot` tidak pernah di-`FLATTEN` otomatis.** Menjual simpanan jangka panjang di tengah flash crash mengunci kerugian di harga terburuk dan membalik tujuan strategi. `KILL` hanya menghentikan pembelian. Keputusan menjual selalu manual.
+5. **Untuk posisi leverage**, prioritasnya berbeda: risiko likuidasi lebih besar daripada risiko jual murah. Kurangi posisi lebih agresif ketika jarak ke harga likuidasi < 2× ATR.
 
 ```python
 import time
@@ -326,8 +364,10 @@ class Breaker:
   "agent_id": "grok-sentiment-01",
   "created_at": "2026-10-09T08:15:30.120Z",
   "expires_at": "2026-10-09T08:16:00.120Z",
+  "strategy": "directional",
   "signal": {
     "signal_id": "sig_btc_20261009T0815",
+    "status": "OK",
     "z": -2.14,
     "n_eff": 184
   },
@@ -355,10 +395,32 @@ class Breaker:
 | `v` | Versi schema. Gateway menolak versi yang tidak dikenal. |
 | `intent_id` | ULID unik, dipakai sebagai kunci idempotensi dan sebagai `client order id` di bursa |
 | `created_at` / `expires_at` | UTC ISO-8601. Maksimal 30 detik dari pembuatan. |
-| `signal` | Referensi ke mesin sentimen. Gateway mengecek ulang ke database, **tidak mempercayai angka di payload**. |
+| `strategy` | Enum: `directional`, `dca_spot`. Memilih profil kebijakan di §3.2. Gateway menentukan profil yang boleh dipakai agen dari konfigurasinya sendiri (`agent_id` → profil), bukan dari isi payload saja. |
+| `signal` | Referensi ke mesin sentimen. `status` bernilai `OK` atau `NO_SIGNAL` (saat `NO_SIGNAL`, `z` bernilai `null`). Gateway mengecek ulang ke database, **tidak mempercayai angka di payload**. |
 | `action` | Enum: `OPEN`, `REDUCE`, `CLOSE`, `CANCEL` |
 | `qty`, `limit_price`, `stop_loss` | **String desimal, bukan float**, untuk menghindari kesalahan presisi (`0.1 + 0.2 ≠ 0.3`). Gateway membulatkan ke `tickSize`/`stepSize` dari info bursa. |
 | `rationale` | Maksimal 280 karakter, hanya disimpan di log |
+
+**Contoh intent profil `dca_spot`** (pembelian boost saat sentimen panik; tanpa `stop_loss`, dan `z` negatif diterima):
+
+```json
+{
+  "v": 1,
+  "intent_id": "01JA7Q8H2D4F6G8J0K2M4N6P8R",
+  "agent_id": "dca-strategy-01",
+  "created_at": "2026-10-13T00:05:10.000Z",
+  "expires_at": "2026-10-13T00:05:40.000Z",
+  "strategy": "dca_spot",
+  "signal": { "signal_id": "sig_btc_20261013T0000", "status": "OK", "z": -2.4, "n_eff": 212 },
+  "action": "OPEN",
+  "venue": "binance",
+  "symbol": "BTCUSDT",
+  "side": "BUY",
+  "order": { "type": "LIMIT", "tif": "IOC", "qty": "0.00510", "limit_price": "60120.00", "max_slippage_bps": 25 },
+  "risk": {},
+  "rationale": "RSI 24, Z -2,4; multiplier 2,1x; sisa slot 40."
+}
+```
 
 **Kenapa formatnya efisien:**
 - Tidak ada field turunan yang bisa dihitung gateway sendiri (misalnya notional atau harga pasar), sehingga tidak ada data yang bisa bertentangan.
@@ -414,13 +476,15 @@ class Risk(Strict):
 
 class Signal(Strict):
     signal_id: str = Field(max_length=64)
-    z: float
-    n_eff: int
+    status: Literal["OK", "NO_SIGNAL"]
+    z: Optional[float] = None          # null jika NO_SIGNAL
+    n_eff: Optional[int] = None
 
 class TradeIntent(Strict):
     v: Literal[1]
     intent_id: str = Field(pattern=r"^[0-9A-HJKMNP-TV-Z]{26}$")
     agent_id: str = Field(max_length=64)
+    strategy: Literal["directional", "dca_spot"]
     created_at: str
     expires_at: str
     signal: Signal
@@ -490,10 +554,13 @@ Setiap intent dicatat secara append-only: payload lengkap, hasil setiap aturan p
 - [ ] Agen tidak punya akses langsung ke API bursa atau ke secret
 - [ ] Semua aturan policy §3.2 punya unit test, termasuk kasus serangan (qty raksasa, simbol asing, harga ngawur, intent kedaluwarsa, replay)
 - [ ] Market order diblok di gateway
+- [ ] Tes profil: `dca_spot` menerima BUY saat `z` negatif dan saat `NO_SIGNAL` (dengan batas notional), serta menolak SELL `OPEN`, stop tidak diwajibkan; `directional` menolak arah yang berlawanan dengan `z` dan menolak tanpa stop
+- [ ] Tes: `REDUCE`/`CLOSE` tidak pernah ditolak oleh batas posisi, eksposur, belanja, atau rugi harian
 - [ ] Shadow mode minimal 2 minggu tanpa kejadian aneh
 
 **Circuit breaker**
-- [ ] Setiap posisi otomatis mendapat stop di bursa. Sudah diuji: kalau pemasangan stop gagal, posisi ditutup.
+- [ ] (`directional`) Setiap posisi otomatis mendapat stop di bursa. Sudah diuji: kalau pemasangan stop gagal, posisi ditutup.
+- [ ] (`dca_spot`) Tidak ada order menggantung (semua `IOC`), dan `KILL` tidak pernah menjual simpanan otomatis
 - [ ] Watchdog berjalan di proses/host terpisah dengan feed harga sendiri
 - [ ] **Uji chaos:** cabut jaringan executor, matikan proses di tengah order, kirim data harga palsu, buat jam server bergeser. Pastikan setiap skenario berakhir di state yang benar.
 - [ ] Kill switch manual diuji dari HP

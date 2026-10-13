@@ -136,15 +136,23 @@ def ingest_asset(conn: psycopg.Connection, x: XClient, asset: Asset, max_pages: 
     return IngestResult(asset.symbol, total, pages, gap)
 
 
+MAX_AGE_FACTOR = 2
+
+
 def snapshot_t60(conn: psycopg.Connection, x: XClient, delay_minutes: int, limit: int = 1000) -> tuple[int, int]:
-    """Ambil metrik tweet yang sudah berumur >= delay_minutes. Return (tersimpan, tidak tersedia)."""
+    """Ambil metrik tweet berumur antara delay_minutes dan MAX_AGE_FACTOR x delay_minutes.
+
+    Tweet yang sudah terlalu tua (job sempat mati) dilewati: metriknya bukan lagi snapshot "t60"
+    dan akan merusak perbandingan antar-tweet. Return (tersimpan, tidak tersedia).
+    """
     ids = [r[0] for r in conn.execute(
         "SELECT t.tweet_id FROM tweets_raw t"
         " WHERE NOT t.is_context AND t.deleted_at IS NULL"
         "   AND t.created_at <= now() - make_interval(mins => %s)"
+        "   AND t.created_at > now() - make_interval(mins => %s)"
         "   AND NOT EXISTS (SELECT 1 FROM tweet_metrics m WHERE m.tweet_id = t.tweet_id AND m.kind = 't60')"
         " ORDER BY t.created_at LIMIT %s",
-        (delay_minutes, limit),
+        (delay_minutes, delay_minutes * MAX_AGE_FACTOR, limit),
     )]
     stored = unavailable = 0
     for i in range(0, len(ids), 100):

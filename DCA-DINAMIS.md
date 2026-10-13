@@ -102,6 +102,8 @@ order        = min( order_kasar , order_pacing , cap_30d − belanja_30d )
 | Cooldown boost | 3 hari | Setelah order dengan m > 1.5, order berikutnya maksimal 1.0× selama 3 hari |
 | Minimum order | Notional minimum bursa | Order di bawah minimum dilewati, bukan dibulatkan ke atas |
 | Konsentrasi aset | Nilai aset ≤ 70% total C | Kalau terlampaui, pembelian berhenti |
+| Order `IOC` tidak terisi | Maks 3 percobaan dalam 15 menit | Tiap percobaan adalah intent baru dengan harga acuan terbaru, tetap di dalam `max_slippage_bps`. Batas harga tidak dilonggarkan. |
+| Slot terlewat | Ulangi di bar berikutnya, maks 2 hari | Satu slot tidak pernah menghasilkan lebih dari satu pembelian terisi. `S` hanya berkurang saat slot terisi atau dilewati permanen. |
 
 ### 2.4 Batas Penurunan Modal (Drawdown)
 
@@ -114,11 +116,35 @@ DD_t   = 1 − E_t / max(E_0..E_t)
 
 | Level | Kondisi | Aksi |
 |-------|---------|------|
-| Waspada | DD ≥ 15% | Multiplier dibatasi maksimal 1.0×, tidak ada boost |
-| Halt | DD ≥ 25% | Pembelian baru berhenti, kirim alert, reset harus manual |
-| Hard stop | DD ≥ 35% atau rugi bulanan > 15% C | Hentikan bot sepenuhnya, evaluasi strategi |
+| Waspada | DD ≥ 30% | Multiplier dibatasi maksimal 1.0×, tidak ada boost |
+| Halt | DD ≥ 45% | Pembelian baru berhenti, kirim alert, reset harus manual |
+| Hard stop | DD ≥ 60% atau rugi bulanan > 30% C | Hentikan bot sepenuhnya, evaluasi strategi |
 
-Ambang di atas **harus disesuaikan** dengan hasil backtest. BTC pernah turun lebih dari 70% dari puncak, jadi akumulator jangka panjang yang murni membeli akan mengalami drawdown besar. Tentukan dulu berapa drawdown yang sanggup kamu tanggung, lalu setel f_dca dan ambang sesuai angka itu.
+**Kenapa angkanya tidak kecil.** Setiap level di atas adalah titik di mana bot **berhenti membeli di harga murah**. Karena DD dihitung pada ekuitas total, ia sama dengan porsi terinvestasi dikali penurunan harga aset dari puncaknya:
+
+```
+DD_ekuitas ≈ porsi_terinvestasi × DD_aset
+```
+
+| Porsi terinvestasi | Waspada (30%) saat aset turun | Halt (45%) saat aset turun | Hard stop (60%) saat aset turun |
+|--------------------|-------------------------------|----------------------------|---------------------------------|
+| 50% | −60% | −90% | tidak tercapai |
+| 80% | −38% | −56% | −75% |
+
+Sebagai pembanding, BTC turun sekitar 84% pada 2018 dan sekitar 77% pada 2022 (puncak ke dasar). Draf awal dokumen ini memakai 15% / 25% / 35% dengan rugi bulanan 15%. Pada porsi terinvestasi 80%, ambang itu terpicu saat aset baru turun 19% / 31% / 44%. Penurunan sebesar itu terjadi hampir di setiap siklus, sehingga bot akan berhenti persis di zona beli yang menjadi alasan strategi ini ada. Rugi bulanan 15% C pun terlampaui oleh satu bulan turun 19% pada porsi terinvestasi 80%. Kondisi itu bertentangan dengan logika "boost saat panik" di §2.2, jadi angkanya dinaikkan.
+
+**Angka ini adalah keputusan pemilik modal, bukan hasil optimasi.** Tentukan dulu kerugian ekuitas yang sanggup ditahan, lalu setel `dd_warn`, `dd_halt`, `dd_hard` dan `f_dca` dari angka itu. Nilai di atas adalah titik awal untuk akumulator berhorison beberapa tahun, dan wajib diuji ulang lewat backtest (§4). Breaker ini ada untuk menangkap kegagalan sistem, bukan untuk menghindari bear market. Kalau toleransimu lebih kecil, kecilkan `f_dca` agar porsi terinvestasi lebih rendah, jangan mempersempit ambang sampai bot berhenti di tengah penurunan.
+
+**Pemetaan ke gateway.** State ini milik Strategy Engine. [Gateway](EKSEKUSI-AMAN.md#41-state-machine) hanya mengenal `NORMAL/DEGRADED/HALT_NEW/KILL`:
+
+| State strategi | Diteruskan ke gateway sebagai |
+|----------------|-------------------------------|
+| NORMAL | NORMAL |
+| WASPADA | Tidak diteruskan (hanya membatasi multiplier di dalam strategi) |
+| HALT | HALT_NEW |
+| HARD_STOP | KILL, tanpa FLATTEN (bot tidak pernah menjual simpanan otomatis) |
+
+Gateway memakai state yang lebih ketat dari kedua sisi.
 
 ### 2.5 Harga Rata-Rata
 
@@ -148,6 +174,19 @@ Take profit dijual bertahap, bukan sekaligus, supaya bot tetap memegang sebagian
 
 **Kenapa ATR?** Jarak trailing tetap (misalnya 8%) terlalu ketat saat volatilitas tinggi (posisi terjual karena noise) dan terlalu longgar saat volatilitas rendah. ATR menyesuaikan jarak dengan volatilitas aktual.
 
+### 2.7 Kontrak dengan Gateway
+
+Semua order bot ini dikirim sebagai intent berprofil `dca_spot` ([EKSEKUSI-AMAN §3.2](EKSEKUSI-AMAN.md#32-policy-engine-deterministik)). Perbedaannya dengan profil `directional` perlu dipahami karena aturan gateway ikut membentuk perilaku strategi:
+
+| Hal | Perilaku `dca_spot` |
+|-----|---------------------|
+| Arah | `OPEN` hanya `BUY`. Penjualan hanya lewat `REDUCE` `SELL` dari trailing take profit. |
+| Sentimen | Arah intent **tidak** dicocokkan dengan tanda Z_t. Beli saat Z negatif memang disengaja. |
+| `NO_SIGNAL` | Order tetap diproses dengan `m_sent = 1`. Gateway membatasi notional ≤ b₀ × (1 + a), jadi bug yang memperbesar order saat `NO_SIGNAL` tertangkap di gateway. |
+| Stop-loss | Tidak ada per pembelian. Perlindungan: pacing, `cap_30d`, batas belanja 24 jam di gateway, dan breaker drawdown (§2.4). |
+| Batas rugi harian | Tidak ada, karena turun beberapa persen dalam sehari normal bagi pemegang spot. |
+| Batas posisi dan eksposur | Posisi per simbol ≤ 0,7 × C dan eksposur total ≤ B. Angka ini sama dengan batas konsentrasi aset di §2.3, supaya gateway tidak menolak pembelian yang sah menurut strategi. |
+
 ---
 
 ## 3. Prompt untuk Grok 4
@@ -170,6 +209,9 @@ sebagai komentar singkat dan pilih opsi yang paling konservatif. Jangan menambah
 4. Semua angka uang dan kuantitas memakai decimal.Decimal, bukan float.
 5. Tidak ada library yang tidak saya sebutkan, kecuali standard library.
    Library yang boleh: pandas, numpy, pytest.
+6. Setiap intent membawa strategy="dca_spot". Aksi yang boleh: OPEN dengan side BUY, REDUCE dengan side SELL
+   (hanya trailing take profit). Tidak ada stop_loss, tidak ada market order, tidak ada CLOSE otomatis.
+   Saat status sentimen NO_SIGNAL, order tetap dikirim tetapi dengan m_sent = 1.
 
 ## STRUKTUR FILE
 - config.py      : dataclass Config berisi semua parameter (lihat PARAMETER), divalidasi di __post_init__
@@ -200,11 +242,15 @@ Jika state breaker WASPADA: m = min(m, 1).
 Cooldown: jika ada order dengan m > 1.5 dalam cooldown_days terakhir, m = min(m, 1).
 order = min(b0 * m, R / max(1, S * gamma), cap_30d - spent_30d)
 Lewati order jika order < min_notional. Lewati jika nilai aset / C > max_asset_share.
+Jika order IOC tidak terisi: ulangi maks 3 kali dalam 15 menit dengan harga acuan terbaru (limit tetap dalam
+max_slippage_bps, tidak pernah dilonggarkan). Jika semua gagal, ulangi slot itu di bar berikutnya, maks 2 hari,
+lalu lewati. Satu slot tidak pernah menghasilkan lebih dari satu pembelian terisi.
 
 ## RISIKO
 E = cash + qty * close ; DD = 1 - E / peak(E)
 DD >= dd_warn -> WASPADA ; DD >= dd_halt -> HALT (tidak ada beli, butuh reset manual)
-DD >= dd_hard -> HARD_STOP (tidak ada aksi apa pun).
+DD >= dd_hard -> HARD_STOP (tidak ada aksi apa pun, dan TIDAK menjual simpanan otomatis).
+Rugi bulanan > monthly_loss_hard * C -> HARD_STOP.
 P_avg memasukkan fee.
 
 ## TRAILING TAKE PROFIT
@@ -217,7 +263,7 @@ Hasil jual masuk ke R. Setelah jual, aktivasi berikutnya dihitung dari harga jua
 C=10000, f_dca=0.8, N=52, buy_every_days=7, a=1.0, b=1.0, RSI_low=35, RSI_floor=15,
 z_on=1.0, z_max=3.0, m_min=0.5, m_max=3.0, sigma_target=dihitung dari median vol 365 hari pertama,
 gamma=0.5, cap_30d_mult=2.0, cooldown_days=3, min_notional=10, max_asset_share=0.7,
-dd_warn=0.15, dd_halt=0.25, dd_hard=0.35, tp_act=0.25, trail_min=0.08, k_atr=3.0,
+dd_warn=0.30, dd_halt=0.45, dd_hard=0.60, monthly_loss_hard=0.30, tp_act=0.25, trail_min=0.08, k_atr=3.0,
 sell_frac=0.3, max_tranches=3, fee_rate=0.001, slippage_bps=10, max_slippage_bps=25.
 
 ## TES (WAJIB, pytest)
@@ -229,6 +275,9 @@ sell_frac=0.3, max_tranches=3, fee_rate=0.001, slippage_bps=10, max_slippage_bps
 6. HALT tidak pernah kembali ke NORMAL tanpa reset manual.
 7. Trailing TP tidak terpicu sebelum aktivasi.
 8. Tidak ada look-ahead: hasil on_bar pada bar t tidak berubah jika data setelah t diganti acak.
+9. Order IOC yang tidak terisi diulang maks 3 kali, lalu slot diulang maks 2 hari; satu slot tidak pernah
+   menghasilkan lebih dari satu pembelian terisi.
+10. Dengan status NO_SIGNAL, notional order tidak pernah melebihi b0 * (1 + a).
 
 ## OUTPUT
 Tulis setiap file lengkap dalam blok kode terpisah dengan nama file sebagai judul.

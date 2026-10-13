@@ -5,7 +5,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 
 from gse.db import add_usage
-from gse.grok_scorer import TweetInput, prompt_hash, score_batch
+from gse.grok_scorer import BatchResult, TweetInput, prompt_hash, score_batch
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +41,31 @@ ORDER BY asset, rn
 """
 
 
+def _is_batch_rejection(exc: Exception) -> bool:
+    """4xx dari API selain 408/429 berarti isi request ditolak, bukan API yang sedang bermasalah."""
+    code = getattr(exc, "status_code", None)
+    return isinstance(code, int) and 400 <= code < 500 and code not in (408, 429)
+
+
+def _score_isolating(client, model: str, batch: list[TweetInput]) -> BatchResult:
+    """Kalau batch ditolak API, nilai satu per satu supaya satu tweet bermasalah tidak memblokir antrean."""
+    try:
+        return score_batch(client, model, batch)
+    except Exception as e:
+        if not _is_batch_rejection(e):
+            raise
+        if len(batch) == 1:
+            log.warning("tweet %s ditolak API (%s); dihitung sebagai percobaan gagal", batch[0].tweet_id, e)
+            return BatchResult(missing_ids=[batch[0].tweet_id])
+        merged = BatchResult()
+        for t in batch:
+            r = _score_isolating(client, model, [t])
+            merged.items += r.items
+            merged.missing_ids += r.missing_ids
+            merged.tokens += r.tokens
+        return merged
+
+
 def score_pending(conn: psycopg.Connection, client, model: str, batch_size: int = 20,
                   limit: int = 200, max_attempts: int = 3, only_golden: bool = False) -> tuple[int, int]:
     """Nilai tweet yang belum punya skor untuk (model, prompt_hash) saat ini, terbaru dulu.
@@ -57,9 +82,10 @@ def score_pending(conn: psycopg.Connection, client, model: str, batch_size: int 
         group = list(group)
         for i in range(0, len(group), batch_size):
             batch = group[i:i + batch_size]
-            # Error API (down, rate limit, kredit habis) dibiarkan naik: run berhenti, batch yang
+            # Error API sementara (down, rate limit, kredit habis) dibiarkan naik: run berhenti, batch yang
             # sudah tersimpan tetap ada, dan attempts tidak bertambah karena tweet-nya tidak bersalah.
-            result = score_batch(client, model, batch)
+            # Penolakan 4xx atas isi request dipecah per tweet dan dihitung sebagai percobaan gagal.
+            result = _score_isolating(client, model, batch)
             items, missing, tokens = result.items, result.missing_ids, result.tokens
             if missing:
                 log.warning("%s: %d tweet tanpa skor valid dari Grok", asset, len(missing))

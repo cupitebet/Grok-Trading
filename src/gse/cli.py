@@ -123,8 +123,8 @@ def cmd_golden_eval(settings, conn, args) -> int:
     print(f"Spearman: {ev.spearman:.3f}   MAE: {ev.mae:.3f}")
     for lang, (n, rho) in ev.by_lang.items():
         print(f"  {lang}: n={n} Spearman={rho:.3f}")
-    ok = not math.isnan(ev.spearman) and ev.spearman >= 0.6 and ev.labeled >= 500
-    print("Gate 1 (golden set >= 500, Spearman >= 0.6):", "LOLOS" if ok else "BELUM")
+    ok = not math.isnan(ev.spearman) and ev.spearman >= 0.6 and ev.scored >= 500
+    print("Gate 1 (golden set bernilai >= 500, Spearman >= 0.6):", "LOLOS" if ok else "BELUM")
     return 0
 
 
